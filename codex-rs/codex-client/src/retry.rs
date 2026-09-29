@@ -90,16 +90,43 @@ where
     F: Fn(Request, u64) -> Fut,
     Fut: Future<Output = Result<T, TransportError>>,
 {
-    for attempt in 0..=policy.max_attempts {
+    let mut attempt = 0u64;
+    let mut transport_retries = 0u64;
+    let mut http_retries = 0u64;
+    let mut http_retry_delay = Duration::from_secs(5);
+    let max_http_retry_delay = Duration::from_secs(60);
+    loop {
         let req = make_req();
         match op(req, attempt).await {
             Ok(resp) => return Ok(resp),
+            Err(err @ TransportError::Http { .. }) if matches!(&err, TransportError::Http { status, .. } if !status.is_success()) =>
+            {
+                // Retry before API-specific error mapping (including authentication and
+                // quota errors). HTTP failures never consume the finite transport budget.
+                http_retries = http_retries.saturating_add(1);
+                let delay = err
+                    .retry_after()
+                    .map(RetryAfter::remaining_delay)
+                    .unwrap_or(http_retry_delay)
+                    .max(http_retry_delay)
+                    .min(max_http_retry_delay);
+                tracing::warn!(
+                    retry_attempt = http_retries,
+                    ?delay,
+                    error = %err,
+                    "HTTP request failed; retrying without an attempt limit"
+                );
+                crate::record_retry!(http_retries, delay, RetryOperation::HttpRequest);
+                tokio::time::sleep(delay).await;
+                http_retry_delay = http_retry_delay.saturating_mul(2).min(max_http_retry_delay);
+            }
             Err(err)
                 if policy
                     .retry_on
-                    .should_retry(&err, attempt, policy.max_attempts) =>
+                    .should_retry(&err, transport_retries, policy.max_attempts) =>
             {
-                let retry_attempt = attempt + 1;
+                transport_retries = transport_retries.saturating_add(1);
+                let retry_attempt = transport_retries;
                 let retry_after = err.retry_after();
                 let delay = retry_after
                     .map(RetryAfter::remaining_delay)
@@ -113,6 +140,6 @@ where
             }
             Err(err) => return Err(err),
         }
+        attempt = attempt.saturating_add(1);
     }
-    Err(TransportError::RetryLimit)
 }
