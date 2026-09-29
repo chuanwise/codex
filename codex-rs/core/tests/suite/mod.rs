@@ -221,6 +221,7 @@ mod turn_error_details;
 mod turn_input_submission;
 mod turn_phase_trace;
 mod turn_state;
+mod unbounded_http_retry;
 mod unified_exec;
 #[path = "unified_exec_launch_failure_tests.rs"]
 mod unified_exec_launch_failure;
