@@ -83,20 +83,20 @@ pub(crate) async fn handle_response_stream_error(
         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
     };
-    let retry_count = retry_state.retries.saturating_add(1);
-    let Some(delay) = err.retry_delay(retry_count) else {
-        return Err(err);
-    };
-    let retry_after = err.retry_after();
-
-    if turn_context
-        .config
-        .features
-        .enabled(Feature::UnboundedConnectionRetries)
-        && matches!(request, ResponsesStreamRequest::Sampling)
-        && matches!(err.details(), CodexErrorDetails::ConnectionFailed(_))
-        && !turn_context.session_source.is_internal()
-        && !turn_context.provider.info().is_amazon_bedrock()
+    // Catch HTTP status errors that reached the stream layer (for example a
+    // WebSocket handshake), before terminal-error and retry-budget checks.
+    let failed_http_status = err
+        .http_status_code_value()
+        .is_some_and(|status| !(200..300).contains(&status));
+    if failed_http_status
+        || (turn_context
+            .config
+            .features
+            .enabled(Feature::UnboundedConnectionRetries)
+            && matches!(request, ResponsesStreamRequest::Sampling)
+            && matches!(err.details(), CodexErrorDetails::ConnectionFailed(_))
+            && !turn_context.session_source.is_internal()
+            && !turn_context.provider.info().is_amazon_bedrock())
     {
         let retry_delay = retry_state.connection_retry_delay;
         warn!(
@@ -115,6 +115,12 @@ pub(crate) async fn handle_response_stream_error(
             .min(MAX_CONNECTION_RETRY_DELAY);
         return Ok(());
     }
+
+    let retry_count = retry_state.retries.saturating_add(1);
+    let Some(delay) = err.retry_delay(retry_count) else {
+        return Err(err);
+    };
+    let retry_after = err.retry_after();
 
     // TODO(anp): Respect server retry advice before issuing the fallback HTTP request.
     if retry_state.retries >= max_retries
