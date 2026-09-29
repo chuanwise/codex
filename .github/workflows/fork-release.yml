@@ -1,0 +1,186 @@
+name: Fork release
+
+on:
+  push:
+    branches: [codex-unbounded-retry]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CODEX_REPO_ROOT: ${{ github.workspace }}
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  test:
+    if: github.repository != 'openai/codex'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29
+        with:
+          tool: just,cargo-nextest,dotslash
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Check Rust formatting
+        working-directory: codex-rs
+        run: cargo fmt --all --check
+      - name: Run retry integration tests
+        run: just test -p codex-api --test unbounded_http_retry --locked
+
+  core-test:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29
+        with:
+          tool: just,cargo-nextest,dotslash
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libcap-dev
+      - name: Run model request recovery integration test
+        run: just test -p codex-core -E 'test(unbounded_http_retry)' --locked
+
+  build:
+    needs: [test, core-test]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          targets: ${{ matrix.target }}
+      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libcap-dev
+      - name: Build and fingerprint bundled Linux sandbox
+        if: runner.os == 'Linux'
+        working-directory: codex-rs
+        run: |
+          cargo build --locked --release --target '${{ matrix.target }}' --bin bwrap
+          digest=$(sha256sum 'target/${{ matrix.target }}/release/bwrap' | cut -d' ' -f1)
+          echo "CODEX_BWRAP_SHA256=$digest" >> "$GITHUB_ENV"
+      - name: Configure Windows SQLite
+        if: runner.os == 'Windows'
+        run: echo 'LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC' >> "$GITHUB_ENV"
+      - name: Build canonical package with runtime helpers
+        run: |
+          args=()
+          suffix=tar.gz
+          if [[ '${{ runner.os }}' == Linux ]]; then
+            args+=(--bwrap-bin 'codex-rs/target/${{ matrix.target }}/release/bwrap')
+          elif [[ '${{ runner.os }}' == Windows ]]; then
+            suffix=zip
+          fi
+          python scripts/build_codex_package.py \
+            --target '${{ matrix.target }}' \
+            --cargo-profile release \
+            --package-dir package \
+            --archive-output "dist/codex-${{ matrix.target }}.$suffix" \
+            "${args[@]}"
+      - name: Smoke test executable
+        run: |
+          exe=package/bin/codex
+          if [[ '${{ runner.os }}' == Windows ]]; then exe+=.exe; fi
+          "$exe" --version
+          "$exe" --help > /dev/null
+      - name: Record checksums and source revision
+        run: |
+          python - <<'PY'
+          import hashlib
+          import pathlib
+          import subprocess
+          target = '${{ matrix.target }}'
+          dist = pathlib.Path('dist')
+          archives = sorted(dist.glob('codex-*'))
+          (dist / f'{target}.sha256').write_text(''.join(
+              f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n'
+              for p in archives
+          ))
+          (dist / f'{target}.source.txt').write_text(
+              subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True)
+          )
+          PY
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: codex-*
+          merge-multiple: true
+          path: dist
+      - name: Publish compiled files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          tag="retry-${RUN_NUMBER}-${RUN_ATTEMPT}-${SOURCE_SHA:0:7}"
+          cat > release-notes.md <<EOF_NOTES
+          Source commit: $SOURCE_SHA
+
+          All non-2xx HTTP errors in shared API requests retry without an attempt limit.
+          Backoff: 5, 10, 20, 40, 60 seconds, then 60 seconds. Retry-After is capped at 60 seconds.
+          HTTP failures do not consume the finite transport retry budget.
+
+          Extract the entire package and run bin/codex (bin/codex.exe on Windows).
+          Keep codex-resources and the companion binaries together.
+          Linux packages use glibc and are built on Ubuntu 24.04. macOS packages are unsigned.
+          EOF_NOTES
+          gh release create "$tag" dist/* \
+            --target "$SOURCE_SHA" \
+            --title "Codex unlimited HTTP retries $tag" \
+            --notes-file release-notes.md \
+            --latest
