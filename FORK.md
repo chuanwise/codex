@@ -14,8 +14,8 @@ The local backoff starts at 5 seconds and doubles to a 60-second maximum.
 `Retry-After` can extend a wait, but each wait remains capped at 60 seconds.
 Requests remain cancellable. Permanent status errors keep retrying until cancelled.
 
-Pushes to the maintained branch, and manual runs of **Fork release**, test the
-retry implementation, build five platform packages, smoke-test them, and publish
+Pushes to the maintained branch, and manual runs of **Fork release**, build
+five platform packages, smoke-test them, and publish
 all packages to a new GitHub Release. The workflow requires no personal tokens,
 upstream signing credentials, paid runners, or npm publishing access. GitHub's
 normal Actions availability and usage limits still apply.
@@ -23,7 +23,10 @@ normal Actions availability and usage limits still apply.
 Download a release archive for your OS and architecture, extract the entire
 archive, and run `bin/codex` (`bin/codex.exe` on Windows). Preserve the adjacent
 `codex-resources`, package manifest, and helper binaries. Linux builds use glibc
-and target Ubuntu 24.04 or compatible newer distributions. macOS builds are unsigned.
+with x86_64 builds targeting Ubuntu 22.04 (glibc 2.35) and compatible newer
+systems, including Debian 13 (glibc 2.41). ARM64 builds target Ubuntu 24.04.
+macOS builds are unsigned. Release builds skip retry regression test jobs;
+the test sources remain available to run manually.
 Each archive has a SHA-256 file and a source commit file.
 
 Run retry regression tests with:
@@ -34,3 +37,4 @@ just test -p codex-api --test unbounded_http_retry --locked
 
 Upstream base for the first fork change:
 `b1e72963c3b71a9265a551e54beff078384efed9`.
+
